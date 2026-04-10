@@ -1,5 +1,5 @@
-flask
-flask-cors
-requests
-streamlit
-pandas
+flask==3.0.2
+flask-cors==4.0.0
+requests==2.31.0
+streamlit==1.32.2
+pandas==2.2.1
