@@ -132,7 +132,7 @@ setInterval(draw, 35);
 """, height=0)
 
 st.markdown('<h1 class="hero-title">REPOSHIELD</h1>', unsafe_allow_html=True)
-st.markdown('<p style="text-align:center; color:#4a4a6a; letter-spacing:10px; margin-top:-20px; font-weight:bold;">VULNERABILITY SCANNING PROTOCOL V3.6</p>', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center; color:#4a4a6a; letter-spacing:10px; margin-top:-20px; font-weight:bold;">VULNERABILITY SCANNING PROTOCOL </p>', unsafe_allow_html=True)
 
 st.write("##")
 c1, c2 = st.columns([4, 1])
