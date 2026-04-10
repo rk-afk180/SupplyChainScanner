@@ -49,8 +49,11 @@ def fetch_and_parse_dependencies(repo_url):
                             line = line.split('#')[0].strip()
                             if not line: continue
                             match = re.split(r'==|>=|~=', line)
+                            
                             if len(match) == 2:
                                 parsed_deps.append({"name": match[0].strip(), "version": match[1].strip(), "ecosystem": target["ecosystem"]})
+                            elif len(match) == 1:
+                                parsed_deps.append({"name": match[0].strip(), "version": "UNPINNED", "ecosystem": target["ecosystem"]})
                     
                     elif target["type"] == "json_composer":
                         data = response.json()
@@ -83,81 +86,101 @@ def scan_dependencies(parsed_deps):
         return {"status": "success", "total_scanned": 0, "vulnerabilities_found": 0, "vulnerable_libraries": []}
 
     queries = []
+    unpinned_libs = []
     
     for dep in parsed_deps:
-        queries.append({
-            "version": dep["version"],
-            "package": {"name": dep["name"], "ecosystem": dep["ecosystem"]}
+        if dep["version"] == "UNPINNED":
+            unpinned_libs.append(dep)
+        else:
+            queries.append({
+                "version": dep["version"],
+                "package": {"name": dep["name"], "ecosystem": dep["ecosystem"]}
+            })
+
+    vulnerable_libraries = []
+
+    for unpinned in unpinned_libs:
+        vulnerable_libraries.append({
+            "library_name": unpinned["name"],
+            "current_version": "UNPINNED",
+            "issue_count": 1,
+            "specific_issues": [{
+                "id": "CONFIG-RISK-01",
+                "summary": "Supply Chain Risk: Unpinned dependency. Your system will auto-download the newest version. If this package is hijacked, your system will instantly pull the malware.",
+                "solution": f"Pin a specific version (e.g., {unpinned['name']}==1.0.0)"
+            }]
         })
 
-    try:
-        osv_batch_url = "https://api.osv.dev/v1/querybatch"
-        response = requests.post(osv_batch_url, json={"queries": queries}, timeout=15)
-        
-        if response.status_code == 200:
-            results = response.json().get("results", [])
-            vulnerable_libraries = []
+    if queries:
+        try:
+            osv_batch_url = "https://api.osv.dev/v1/querybatch"
+            response = requests.post(osv_batch_url, json={"queries": queries}, timeout=15)
             
-            for index, result in enumerate(results):
-                if "vulns" in result:
-                    package_info = parsed_deps[index]
-                    package_issues = []
-                    
-                    for vuln in result["vulns"]:
-                        summary = vuln.get("summary")
-                        if not summary:
-                            details = vuln.get("details")
-                            if details:
-                                summary = details[:200] + "..." if len(details) > 200 else details
-                            else:
-                                aliases = vuln.get("aliases", [])
-                                vuln_id = vuln.get("id", "Unknown ID")
-                                if aliases:
-                                    alias_str = ", ".join(aliases[:2]) 
-                                    summary = f"Security flaw identified ({alias_str}). Read the advisory link for full impact details."
+            if response.status_code == 200:
+                results = response.json().get("results", [])
+                
+                for index, result in enumerate(results):
+                    if "vulns" in result:
+                        package_info = queries[index]["package"]
+                        package_version = queries[index]["version"]
+                        package_issues = []
+                        
+                        for vuln in result["vulns"]:
+                            summary = vuln.get("summary")
+                            if not summary:
+                                details = vuln.get("details")
+                                if details:
+                                    summary = details[:200] + "..." if len(details) > 200 else details
                                 else:
-                                    summary = f"Security vulnerability ({vuln_id}) detected. See OSV database link for details."
-                        
-                        solution = None
-                        for affected in vuln.get("affected", []):
-                            for r in affected.get("ranges", []):
-                                for ev in r.get("events", []):
-                                    if "fixed" in ev:
-                                        solution = f"Upgrade to v{ev['fixed']}"
-                                        break
+                                    aliases = vuln.get("aliases", [])
+                                    vuln_id = vuln.get("id", "Unknown ID")
+                                    if aliases:
+                                        alias_str = ", ".join(aliases[:2]) 
+                                        summary = f"Security flaw identified ({alias_str}). Read the advisory link for full impact details."
+                                    else:
+                                        summary = f"Security vulnerability ({vuln_id}) detected. See OSV database link for details."
+                            
+                            solution = None
+                            for affected in vuln.get("affected", []):
+                                for r in affected.get("ranges", []):
+                                    for ev in r.get("events", []):
+                                        if "fixed" in ev:
+                                            solution = f"Upgrade to v{ev['fixed']}"
+                                            break
 
-                        if not solution:
-                            references = vuln.get("references", [])
-                            if references:
-                                solution = references[0].get("url", "No URL")
-                            else:
-                                vuln_id = vuln.get("id", "")
-                                solution = f"https://osv.dev/vulnerability/{vuln_id}"
-                        
-                        package_issues.append({
-                            "id": vuln.get("id"),
-                            "summary": summary,
-                            "solution": solution
+                            if not solution:
+                                references = vuln.get("references", [])
+                                if references:
+                                    solution = references[0].get("url", "No URL")
+                                else:
+                                    vuln_id = vuln.get("id", "")
+                                    solution = f"https://osv.dev/vulnerability/{vuln_id}"
+                            
+                            package_issues.append({
+                                "id": vuln.get("id"),
+                                "summary": summary,
+                                "solution": solution
+                            })
+                            
+                        vulnerable_libraries.append({
+                            "library_name": package_info["name"],
+                            "current_version": package_version,
+                            "issue_count": len(package_issues),
+                            "specific_issues": package_issues
                         })
-                        
-                    vulnerable_libraries.append({
-                        "library_name": package_info["name"],
-                        "current_version": package_info["version"],
-                        "issue_count": len(package_issues),
-                        "specific_issues": package_issues
-                    })
-            
-            return {
-                "status": "success",
-                "total_scanned": len(parsed_deps),
-                "vulnerabilities_found": len(vulnerable_libraries),
-                "vulnerable_libraries": vulnerable_libraries
-            }
-            
-        return {"status": "error", "error": f"OSV API Error: {response.status_code}"}
-        
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+                
+            else:
+                return {"status": "error", "error": f"OSV API Error: {response.status_code}"}
+                
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    return {
+        "status": "success",
+        "total_scanned": len(parsed_deps),
+        "vulnerabilities_found": len(vulnerable_libraries),
+        "vulnerable_libraries": vulnerable_libraries
+    }
 
 @app.route("/scan", methods=["POST"])
 def handle_scan():
