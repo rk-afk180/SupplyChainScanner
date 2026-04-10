@@ -2,31 +2,33 @@ import streamlit as st
 import requests
 import pandas as pd
 
-st.set_page_config(page_title="Supply Chain Scanner",layout="wide")
+st.set_page_config(page_title="Supply Chain Scanner", layout="wide")
 
 st.markdown("""
-<style>
-.main { background : 0f2027; color: white; }
-.card { background : rgba(255,255,255,0.05);border-radius: 10px; padding: 15px;margin-bottom: 10px;)
-</style>
-""",unsafe_allow_html=True)
+    <style>
+    .main { background: #0f2027; color: white; }
+    .card { background: rgba(255,255,255,0.05); border-radius: 10px; padding: 15px; margin-bottom: 10px; }
+    </style>
+""", unsafe_allow_html=True)
 
-st.title("Supply Chain Vulnerability Scanner)
+st.title("Supply Chain Vulnerability Scanner")
 
-repo_url=st.txt_input("Enter you GitHub Repository URL","")
+repo_url = st.text_input("Enter any GitHub Repository URL (e.g., https://github.com/facebook/react)", "")
 
 if st.button("Start Scan"):
-  if not repo_url.strip():
-    st.warning("please enter a GitHub repository  URL first.")
-  else:
-    with st.spinner("Analyzing dependencies")
-        try:
-          response = requests.post("http://127.0.0.1:5001/scan", json={"repo_url": repo_url}
-             if response.status_code == 200:
+    if not repo_url.strip():
+        st.warning("Please enter a GitHub repository URL first.")
+    else:
+        with st.spinner("Analyzing dependencies..."):
+            try:
+                response = requests.post("http://127.0.0.1:5001/scan", json={"repo_url": repo_url})
+                
+                if response.status_code == 200:
                     results = response.json()
-             if results.get("status") == "success":
+                    
+                    if results.get("status") == "success":
                         st.success("Analysis Complete")
-
+                        
                         m1, m2 = st.columns(2)
                         m1.metric("Total Libraries Scanned", results.get("total_scanned", 0))
                         
