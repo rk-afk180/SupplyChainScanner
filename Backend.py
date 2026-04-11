@@ -2,9 +2,96 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import re
+import concurrent.futures
 
 app = Flask(__name__)
 CORS(app) 
+
+TARGET_MAP = {
+    "package.json": {"ecosystem": "npm", "type": "json_npm"},
+    "requirements.txt": {"ecosystem": "PyPI", "type": "text_pypi"},
+    "composer.json": {"ecosystem": "Packagist", "type": "json_composer"},
+    "pom.xml": {"ecosystem": "Maven", "type": "xml_maven"},
+    "go.mod": {"ecosystem": "Go", "type": "text_go"},
+    "pyproject.toml": {"ecosystem": "PyPI", "type": "toml_pypi"},
+    "Pipfile": {"ecosystem": "PyPI", "type": "toml_pypi"},
+    "build.gradle": {"ecosystem": "Maven", "type": "gradle_maven"},
+    "Cargo.toml": {"ecosystem": "crates.io", "type": "toml_rust"},
+    "Gemfile": {"ecosystem": "RubyGems", "type": "text_ruby"}
+}
+
+def fetch_single_file(file_data, owner, repo, default_branch):
+    """Fetches and parses a single file. Designed to run in a thread."""
+    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{default_branch}/{file_data['path']}"
+    target_info = file_data['info']
+    parsed_deps = []
+    
+    try:
+        file_response = requests.get(raw_url, timeout=10)
+        if file_response.status_code != 200:
+            return []
+            
+        text_content = file_response.text
+        
+        if target_info["type"] == "json_npm":
+            data = file_response.json()
+            deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+            for name, ver in deps.items():
+                clean_ver = ver.lstrip('^~<>=').split(' ')[0]
+                parsed_deps.append({"name": name, "version": clean_ver, "ecosystem": target_info["ecosystem"]})
+                
+        elif target_info["type"] == "text_pypi":
+            for line in text_content.split('\n'):
+                line = line.split('#')[0].strip()
+                if not line: continue
+                match = re.split(r'==|>=|~=', line)
+                if len(match) == 2:
+                    parsed_deps.append({"name": match[0].strip(), "version": match[1].strip(), "ecosystem": target_info["ecosystem"]})
+                elif len(match) == 1:
+                    parsed_deps.append({"name": match[0].strip(), "version": "UNPINNED", "ecosystem": target_info["ecosystem"]})
+        
+        elif target_info["type"] == "json_composer":
+            data = file_response.json()
+            deps = {**data.get("require", {}), **data.get("require-dev", {})}
+            for name, ver in deps.items():
+                if name.lower() == "php" or "/" not in name: continue
+                clean_ver = ver.lstrip('^~<>=').split(' ')[0].replace('*', '')
+                if clean_ver:
+                    parsed_deps.append({"name": name, "version": clean_ver, "ecosystem": target_info["ecosystem"]})
+
+        elif target_info["type"] == "xml_maven":
+            for group, artifact, version in re.findall(r'<dependency>\s*<groupId>([^<]+)</groupId>\s*<artifactId>([^<]+)</artifactId>\s*<version>([^<]+)</version>', text_content):
+                if not version.startswith('$'):
+                    parsed_deps.append({"name": f"{group}:{artifact}", "version": version, "ecosystem": target_info["ecosystem"]})
+
+        elif target_info["type"] == "text_go":
+            for name, version in re.findall(r'^\s*([a-zA-Z0-9\.\-\/\_]+)\s+(v[0-9\.\-\w]+)', text_content, re.MULTILINE):
+                parsed_deps.append({"name": name, "version": version.lstrip('v'), "ecosystem": target_info["ecosystem"]})
+
+        elif target_info["type"] == "toml_pypi":
+            for name, version in re.findall(r'^([a-zA-Z0-9\-_]+)\s*=\s*["\']([^\*"\']+)["\']', text_content, re.MULTILINE):
+                if name.lower() not in ["python", "name", "version", "description"]:
+                    parsed_deps.append({"name": name, "version": version.lstrip('^~<>=').split(' ')[0], "ecosystem": target_info["ecosystem"]})
+
+        elif target_info["type"] == "gradle_maven":
+            for group, artifact, version in re.findall(r'(?:implementation|api|compileOnly|testImplementation)\s*[\'"]([^\:]+)\:([^\:]+)\:([^\'"]+)[\'"]', text_content):
+                if not version.startswith('$'): 
+                    parsed_deps.append({"name": f"{group}:{artifact}", "version": version, "ecosystem": target_info["ecosystem"]})
+
+        elif target_info["type"] == "toml_rust":
+            for match in re.findall(r'^([a-zA-Z0-9\-_]+)\s*=\s*(?:["\']([^"\']+)["\']|\{[^}]*version\s*=\s*["\']([^"\']+)["\'])', text_content, re.MULTILINE):
+                name, version = match[0], match[1] if match[1] else match[2]
+                if name not in ["name", "version"] and version:
+                    parsed_deps.append({"name": name, "version": version.lstrip('^~= '), "ecosystem": target_info["ecosystem"]})
+
+        elif target_info["type"] == "text_ruby":
+            for name, version in re.findall(r'^\s*gem\s+[\'"]([^\'"]+)[\'"](?:\s*,\s*[\'"]([^\'"]+)[\'"])?', text_content, re.MULTILINE):
+                parsed_deps.append({"name": name, "version": version.lstrip('~> =') if version else "UNPINNED", "ecosystem": target_info["ecosystem"]})
+                
+    except Exception:
+        pass
+        
+    return parsed_deps
 
 def fetch_and_parse_dependencies(repo_url):
     clean_url = repo_url.replace(".git", "").rstrip('/')
@@ -13,26 +100,13 @@ def fetch_and_parse_dependencies(repo_url):
     if len(url_parts) < 2:
         return {"error": "Invalid GitHub repository URL format."}
         
-    owner = url_parts[-2]
-    repo = url_parts[-1]
-
-    target_map = {
-        "package.json": {"ecosystem": "npm", "type": "json_npm"},
-        "requirements.txt": {"ecosystem": "PyPI", "type": "text_pypi"},
-        "composer.json": {"ecosystem": "Packagist", "type": "json_composer"},
-        "pom.xml": {"ecosystem": "Maven", "type": "xml_maven"},
-        "go.mod": {"ecosystem": "Go", "type": "text_go"},
-        "pyproject.toml": {"ecosystem": "PyPI", "type": "toml_pypi"},
-        "Pipfile": {"ecosystem": "PyPI", "type": "toml_pypi"},
-        "build.gradle": {"ecosystem": "Maven", "type": "gradle_maven"},
-        "Cargo.toml": {"ecosystem": "crates.io", "type": "toml_rust"},
-        "Gemfile": {"ecosystem": "RubyGems", "type": "text_ruby"}
-    }
+    owner, repo = url_parts[-2], url_parts[-1]
     
     session = requests.Session()
     session.headers.update({"Accept": "application/vnd.github.v3+json"})
 
     try:
+        
         repo_api_url = f"https://api.github.com/repos/{owner}/{repo}"
         repo_response = session.get(repo_api_url, timeout=10)
         
@@ -45,6 +119,7 @@ def fetch_and_parse_dependencies(repo_url):
             
         default_branch = repo_response.json().get("default_branch", "main")
 
+       
         tree_api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1"
         tree_response = session.get(tree_api_url, timeout=15)
         
@@ -53,89 +128,39 @@ def fetch_and_parse_dependencies(repo_url):
         elif tree_response.status_code != 200:
             return {"error": f"Failed to fetch repository tree. GitHub Status: {tree_response.status_code}"}
 
-        tree_data = tree_response.json().get("tree", [])
-        
+        tree_data = tree_response.json()
+        if tree_data.get("truncated"):
+            print("Warning: Repository is massive. GitHub truncated the file tree. Results may be partial.")
+            
         matching_files = []
-        for item in tree_data:
+        for item in tree_data.get("tree", []):
             if item["type"] == "blob": 
                 filename = item["path"].split('/')[-1]
-                if filename in target_map:
-                    matching_files.append({"path": item["path"], "info": target_map[filename]})
+                if filename in TARGET_MAP:
+                    matching_files.append({"path": item["path"], "info": TARGET_MAP[filename]})
 
         if not matching_files:
             return {"error": "No supported dependency files found anywhere in this repository."}
 
+        
         all_parsed_deps = []
-        for file_data in matching_files:
-            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{default_branch}/{file_data['path']}"
-            target_info = file_data['info']
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(fetch_single_file, fd, owner, repo, default_branch) for fd in matching_files]
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    all_parsed_deps.extend(result)
+
+        
+        unique_deps_map = {}
+        for dep in all_parsed_deps:
             
-            raw_session = requests.Session()
-            file_response = raw_session.get(raw_url, timeout=5)
+            key = f"{dep['ecosystem']}::{dep['name']}::{dep['version']}"
+            unique_deps_map[key] = dep
             
-            if file_response.status_code == 200:
-                text_content = file_response.text
-                
-                if target_info["type"] == "json_npm":
-                    try:
-                        data = file_response.json()
-                        deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
-                        for name, ver in deps.items():
-                            clean_ver = ver.lstrip('^~<>=').split(' ')[0]
-                            all_parsed_deps.append({"name": name, "version": clean_ver, "ecosystem": target_info["ecosystem"]})
-                    except: pass
-                        
-                elif target_info["type"] == "text_pypi":
-                    for line in text_content.split('\n'):
-                        line = line.split('#')[0].strip()
-                        if not line: continue
-                        match = re.split(r'==|>=|~=', line)
-                        if len(match) == 2:
-                            all_parsed_deps.append({"name": match[0].strip(), "version": match[1].strip(), "ecosystem": target_info["ecosystem"]})
-                        elif len(match) == 1:
-                            all_parsed_deps.append({"name": match[0].strip(), "version": "UNPINNED", "ecosystem": target_info["ecosystem"]})
-                
-                elif target_info["type"] == "json_composer":
-                    try:
-                        data = file_response.json()
-                        deps = {**data.get("require", {}), **data.get("require-dev", {})}
-                        for name, ver in deps.items():
-                            if name.lower() == "php" or "/" not in name: continue
-                            clean_ver = ver.lstrip('^~<>=').split(' ')[0].replace('*', '')
-                            if clean_ver:
-                                all_parsed_deps.append({"name": name, "version": clean_ver, "ecosystem": target_info["ecosystem"]})
-                    except: pass
+        unique_deps = list(unique_deps_map.values())
 
-                elif target_info["type"] == "xml_maven":
-                    for group, artifact, version in re.findall(r'<dependency>\s*<groupId>([^<]+)</groupId>\s*<artifactId>([^<]+)</artifactId>\s*<version>([^<]+)</version>', text_content):
-                        if not version.startswith('$'):
-                            all_parsed_deps.append({"name": f"{group}:{artifact}", "version": version, "ecosystem": target_info["ecosystem"]})
-
-                elif target_info["type"] == "text_go":
-                    for name, version in re.findall(r'^\s*([a-zA-Z0-9\.\-\/\_]+)\s+(v[0-9\.\-\w]+)', text_content, re.MULTILINE):
-                        all_parsed_deps.append({"name": name, "version": version.lstrip('v'), "ecosystem": target_info["ecosystem"]})
-
-                elif target_info["type"] == "toml_pypi":
-                    for name, version in re.findall(r'^([a-zA-Z0-9\-_]+)\s*=\s*["\']([^\*"\']+)["\']', text_content, re.MULTILINE):
-                        if name.lower() not in ["python", "name", "version", "description"]:
-                            all_parsed_deps.append({"name": name, "version": version.lstrip('^~<>=').split(' ')[0], "ecosystem": target_info["ecosystem"]})
-
-                elif target_info["type"] == "gradle_maven":
-                    for group, artifact, version in re.findall(r'(?:implementation|api|compileOnly|testImplementation)\s*[\'"]([^\:]+)\:([^\:]+)\:([^\'"]+)[\'"]', text_content):
-                        if not version.startswith('$'): 
-                            all_parsed_deps.append({"name": f"{group}:{artifact}", "version": version, "ecosystem": target_info["ecosystem"]})
-
-                elif target_info["type"] == "toml_rust":
-                    for match in re.findall(r'^([a-zA-Z0-9\-_]+)\s*=\s*(?:["\']([^"\']+)["\']|\{[^}]*version\s*=\s*["\']([^"\']+)["\'])', text_content, re.MULTILINE):
-                        name, version = match[0], match[1] if match[1] else match[2]
-                        if name not in ["name", "version"] and version:
-                            all_parsed_deps.append({"name": name, "version": version.lstrip('^~= '), "ecosystem": target_info["ecosystem"]})
-
-                elif target_info["type"] == "text_ruby":
-                    for name, version in re.findall(r'^\s*gem\s+[\'"]([^\'"]+)[\'"](?:\s*,\s*[\'"]([^\'"]+)[\'"])?', text_content, re.MULTILINE):
-                        all_parsed_deps.append({"name": name, "version": version.lstrip('~> =') if version else "UNPINNED", "ecosystem": target_info["ecosystem"]})
-
-        return {"data": all_parsed_deps} if all_parsed_deps else {"error": "Supported files found, but they were empty or unreadable."}
+        return {"data": unique_deps} if unique_deps else {"error": "Supported files found, but they were empty or unreadable."}
         
     except Exception as e:
         return {"error": f"An unexpected backend error occurred: {str(e)}"}
@@ -167,37 +192,45 @@ def scan_dependencies(parsed_deps):
             }]
         })
 
+   
+    CHUNK_SIZE = 500 
+    
     if queries:
         try:
-            response = requests.post("https://api.osv.dev/v1/querybatch", json={"queries": queries}, timeout=15)
-            if response.status_code == 200:
-                for index, result in enumerate(response.json().get("results", [])):
-                    if "vulns" in result:
-                        package_info, package_version = queries[index]["package"], queries[index]["version"]
-                        package_issues = []
-                        
-                        for vuln in result["vulns"]:
-                            summary = vuln.get("summary") or vuln.get("details", "")[:200] + "..."
-                            if not summary: summary = f"Security vulnerability ({vuln.get('id', 'Unknown')}) detected."
+            for i in range(0, len(queries), CHUNK_SIZE):
+                query_chunk = queries[i:i + CHUNK_SIZE]
+                response = requests.post("https://api.osv.dev/v1/querybatch", json={"queries": query_chunk}, timeout=20)
+                
+                if response.status_code == 200:
+                    for index, result in enumerate(response.json().get("results", [])):
+                        if "vulns" in result:
+                            package_info = query_chunk[index]["package"]
+                            package_version = query_chunk[index]["version"]
+                            package_issues = []
                             
-                            solution = None
-                            for affected in vuln.get("affected", []):
-                                for r in affected.get("ranges", []):
-                                    for ev in r.get("events", []):
-                                        if "fixed" in ev:
-                                            solution = f"Upgrade to v{ev['fixed']}"
-                                            break
+                            for vuln in result["vulns"]:
+                                summary = vuln.get("summary") or vuln.get("details", "")[:200] + "..."
+                                if not summary: summary = f"Security vulnerability ({vuln.get('id', 'Unknown')}) detected."
+                                
+                                solution = None
+                                for affected in vuln.get("affected", []):
+                                    for r in affected.get("ranges", []):
+                                        for ev in r.get("events", []):
+                                            if "fixed" in ev:
+                                                solution = f"Upgrade to v{ev['fixed']}"
+                                                break
 
-                            solution = solution or (vuln.get("references", [{}])[0].get("url") or f"https://osv.dev/vulnerability/{vuln.get('id', '')}")
-                            
-                            package_issues.append({"id": vuln.get("id"), "summary": summary, "solution": solution})
-                            
-                        vulnerable_libraries.append({
-                            "library_name": package_info["name"], "current_version": package_version,
-                            "issue_count": len(package_issues), "specific_issues": package_issues
-                        })
-            else:
-                return {"error": f"OSV API Error: {response.status_code}"}
+                                solution = solution or (vuln.get("references", [{}])[0].get("url") or f"https://osv.dev/vulnerability/{vuln.get('id', '')}")
+                                
+                                package_issues.append({"id": vuln.get("id"), "summary": summary, "solution": solution})
+                                
+                            vulnerable_libraries.append({
+                                "library_name": package_info["name"], "current_version": package_version,
+                                "issue_count": len(package_issues), "specific_issues": package_issues
+                            })
+                else:
+                    return {"error": f"OSV API Error on chunk: {response.status_code}"}
+                    
         except Exception as e:
             return {"error": f"Failed to connect to OSV database: {str(e)}"}
 
